@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS access_logs (
     user_name TEXT,
     fingerprint_id INTEGER,
     access_status TEXT NOT NULL,
+    door_state TEXT NOT NULL DEFAULT 'LOCKED',
     timestamp TEXT NOT NULL,
     FOREIGN KEY (zone_id) REFERENCES zones(id)
 );

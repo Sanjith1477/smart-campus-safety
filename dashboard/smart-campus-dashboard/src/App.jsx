@@ -1,26 +1,40 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { io } from "socket.io-client";
 import {
   Activity,
-  BellRing,
-  CircleAlert,
-  Gauge,
-  Lock,
+  Command,
+  HeartPulse,
   Map,
+  Menu,
   Radio,
   Route,
-  ShieldCheck,
+  Shield,
   ShieldAlert,
-  Siren,
-  Thermometer,
-  Users,
   Wifi,
-  WifiOff
+  WifiOff,
+  X
 } from "lucide-react";
+import {
+  AccessControlPage,
+  DemoPage,
+  IncidentsPage,
+  OverviewPage,
+  SafeRoutePage,
+  SystemHealthPage
+} from "./pages";
 
 const BACKEND = "http://localhost:3000";
-
-const initialTelemetry = {
+const CAMPUS_ZONES = ["LAB", "CLASSROOM", "SECURITY CENTER", "CANTEEN", "PARKING", "MAIN GATE"];
+const NAV_ITEMS = [
+  { id: "overview", label: "Overview", icon: Map },
+  { id: "routes", label: "Safe Route", icon: Route },
+  { id: "incidents", label: "Incidents", icon: ShieldAlert },
+  { id: "access", label: "Access Control", icon: Shield },
+  { id: "health", label: "System Health", icon: HeartPulse },
+  { id: "demo", label: "Demo / Simulation", icon: Command }
+];
+const EMPTY_HEALTH = ["DHT", "MQ2", "PIR", "IR", "LDR", "FINGERPRINT"];
+const BASE_TELEMETRY = {
   temperatureC: 0,
   humidityPct: 0,
   gasIndex: 0,
@@ -39,113 +53,162 @@ const initialTelemetry = {
   action: "MONITOR SYSTEM"
 };
 
-const zoneLayout = {
-  LAB: { x: 6, y: 8 },
-  CLASSROOM: { x: 40, y: 8 },
-  "SECURITY CENTER": { x: 40, y: 42 },
-  CANTEEN: { x: 6, y: 72 },
-  PARKING: { x: 72, y: 58 },
-  "MAIN GATE": { x: 72, y: 86 }
-};
-
-const edges = [
-  ["LAB", "CLASSROOM"],
-  ["LAB", "SECURITY CENTER"],
-  ["CLASSROOM", "SECURITY CENTER"],
-  ["SECURITY CENTER", "CANTEEN"],
-  ["SECURITY CENTER", "PARKING"],
-  ["SECURITY CENTER", "MAIN GATE"],
-  ["PARKING", "MAIN GATE"]
-];
-
-function severityClass(severity) {
-  return {
-    NORMAL: "normal",
-    WARNING: "warning",
-    HIGH: "high",
-    CRITICAL: "critical"
-  }[severity] || "normal";
-}
-
 function App() {
-  const [telemetry, setTelemetry] = useState(initialTelemetry);
-  const [incident, setIncident] = useState({
-    type: "NORMAL",
-    severity: "NORMAL",
-    action: "Continue monitoring."
-  });
+  const [page, setPage] = useState("overview");
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [telemetry, setTelemetry] = useState(BASE_TELEMETRY);
+  const [incident, setIncident] = useState(null);
   const [route, setRoute] = useState({ route: [], totalCost: null });
   const [zones, setZones] = useState([]);
   const [incidents, setIncidents] = useState([]);
-  const [backendOnline, setBackendOnline] = useState(false);
+  const [activeIncidents, setActiveIncidents] = useState([]);
+  const [accessLogs, setAccessLogs] = useState([]);
+  const [sensorHealth, setSensorHealth] = useState([]);
+  const [connectionStatus, setConnectionStatus] = useState("RECONNECTING");
   const [lastUpdate, setLastUpdate] = useState(null);
-  const [message, setMessage] = useState("");
+  const [conditionsRevision, setConditionsRevision] = useState(0);
+  const [notice, setNotice] = useState("");
+  const [pendingScenario, setPendingScenario] = useState("");
+  const [scenarioMessage, setScenarioMessage] = useState("");
+  const latestRevision = useRef(-1);
+  const latestConditionSignature = useRef(null);
+  const connectionGeneration = useRef(0);
 
-  const zoneMap = useMemo(
-    () => Object.fromEntries(zones.map((z) => [z.name, z])),
-    [zones]
-  );
+  const applySnapshot = useCallback((snapshot) => {
+    if (!snapshot || typeof snapshot !== "object") return;
+    const incomingRevision = Number(snapshot.revision);
+    if (Number.isFinite(incomingRevision) && incomingRevision < latestRevision.current) return;
+    if (Number.isFinite(incomingRevision)) latestRevision.current = incomingRevision;
 
-  useEffect(() => {
-    let socket;
-
-    async function loadInitial() {
-      try {
-        const [healthRes, zonesRes, latestRes, incidentsRes] = await Promise.all([
-          fetch(`${BACKEND}/api/health`),
-          fetch(`${BACKEND}/api/zones`),
-          fetch(`${BACKEND}/api/telemetry/latest`),
-          fetch(`${BACKEND}/api/incidents`)
-        ]);
-
-        setBackendOnline(healthRes.ok);
-
-        if (zonesRes.ok) setZones(await zonesRes.json());
-
-        if (latestRes.ok) {
-          const latest = await latestRes.json();
-          if (latest && !latest.message) setTelemetry((p) => ({ ...p, ...latest }));
-        }
-
-        if (incidentsRes.ok) setIncidents(await incidentsRes.json());
-      } catch (error) {
-        setBackendOnline(false);
-        setMessage("Backend not reachable on port 3000.");
+    if ("telemetry" in snapshot) {
+      setTelemetry(snapshot.telemetry
+        ? (previous) => ({ ...previous, ...snapshot.telemetry })
+        : BASE_TELEMETRY);
+    }
+    if ("incident" in snapshot) setIncident(snapshot.incident);
+    if (snapshot.route) setRoute(snapshot.route);
+    if (Array.isArray(snapshot.zones)) {
+      setZones(snapshot.zones);
+      const signature = snapshot.zones
+        .map((zone) => `${zone.name}:${zone.status}:${zone.crowd_level}:${zone.occupancy}`)
+        .join("|");
+      if (latestConditionSignature.current === null) {
+        latestConditionSignature.current = signature;
+      } else if (latestConditionSignature.current !== signature) {
+        latestConditionSignature.current = signature;
+        setConditionsRevision((current) => current + 1);
       }
     }
-
-    loadInitial();
-
-    socket = io(BACKEND, {
-      transports: ["websocket", "polling"]
-    });
-
-    socket.on("connect", () => {
-      setBackendOnline(true);
-      setMessage("Live connection established.");
-    });
-
-    socket.on("disconnect", () => {
-      setBackendOnline(false);
-      setMessage("Live connection lost.");
-    });
-
-    socket.on("systemUpdate", (payload) => {
-      if (payload.telemetry) {
-        setTelemetry((p) => ({ ...p, ...payload.telemetry }));
-      }
-      if (payload.incident) setIncident(payload.incident);
-      if (payload.route) setRoute(payload.route);
-      if (payload.timestamp) setLastUpdate(payload.timestamp);
-      setBackendOnline(true);
-    });
-
-    socket.on("sosAlert", (payload) => {
-      setMessage(`SOS received from ${payload.zone}.`);
-    });
-
-    return () => socket?.disconnect();
+    if (Array.isArray(snapshot.incidents)) setIncidents(snapshot.incidents);
+    if (Array.isArray(snapshot.activeIncidents)) setActiveIncidents(snapshot.activeIncidents);
+    if (Array.isArray(snapshot.accessLogs)) setAccessLogs(snapshot.accessLogs);
+    if (Array.isArray(snapshot.sensorHealth)) setSensorHealth(snapshot.sensorHealth);
+    if ("timestamp" in snapshot) setLastUpdate(snapshot.timestamp || snapshot.telemetry?.receivedAt || null);
   }, []);
+
+  const fetchSnapshot = useCallback(async (generation = connectionGeneration.current) => {
+    const response = await fetch(`${BACKEND}/api/snapshot`);
+    if (!response.ok) throw new Error(`Snapshot request failed (${response.status}).`);
+    const snapshot = await response.json();
+    if (generation === connectionGeneration.current) applySnapshot(snapshot);
+  }, [applySnapshot]);
+
+  useEffect(() => {
+    let offlineTimer;
+    const socket = io(BACKEND, {
+      transports: ["websocket", "polling"],
+      reconnection: true,
+      autoConnect: false
+    });
+
+    const clearOfflineTimer = () => {
+      if (offlineTimer) clearTimeout(offlineTimer);
+      offlineTimer = undefined;
+    };
+    const markReconnecting = () => {
+      setConnectionStatus("RECONNECTING");
+      clearOfflineTimer();
+      offlineTimer = setTimeout(() => {
+        if (!socket.connected) setConnectionStatus("OFFLINE");
+      }, 10000);
+    };
+    const onConnect = () => {
+      clearOfflineTimer();
+      setConnectionStatus("LIVE");
+      setNotice((current) => current?.startsWith("Snapshot synchronization failed:")
+        ? ""
+        : current);
+      latestRevision.current = -1;
+      connectionGeneration.current += 1;
+      fetchSnapshot(connectionGeneration.current).catch((error) => {
+        setNotice(`Snapshot synchronization failed: ${error.message}`);
+      });
+    };
+    const onDisconnect = () => {
+      connectionGeneration.current += 1;
+      markReconnecting();
+    };
+    const onConnectError = () => markReconnecting();
+    const onSystemUpdate = (snapshot) => {
+      applySnapshot(snapshot);
+      setConnectionStatus(socket.connected ? "LIVE" : "RECONNECTING");
+      setNotice((current) => current?.startsWith("Snapshot synchronization failed:")
+        ? ""
+        : current);
+    };
+    const onSosAlert = (payload) => {
+      setNotice(`SOS received from ${payload.zone}.`);
+    };
+    const onReconnectAttempt = () => markReconnecting();
+    const connectTimer = setTimeout(() => socket.connect(), 0);
+
+    socket.on("connect", onConnect);
+    socket.on("disconnect", onDisconnect);
+    socket.on("connect_error", onConnectError);
+    socket.on("systemUpdate", onSystemUpdate);
+    socket.on("sosAlert", onSosAlert);
+    socket.io.on("reconnect_attempt", onReconnectAttempt);
+
+    return () => {
+      clearTimeout(connectTimer);
+      clearOfflineTimer();
+      socket.off("connect", onConnect);
+      socket.off("disconnect", onDisconnect);
+      socket.off("connect_error", onConnectError);
+      socket.off("systemUpdate", onSystemUpdate);
+      socket.off("sosAlert", onSosAlert);
+      socket.io.off("reconnect_attempt", onReconnectAttempt);
+      socket.disconnect();
+    };
+  }, [applySnapshot, fetchSnapshot]);
+
+  useEffect(() => {
+    if (connectionStatus === "LIVE") return undefined;
+
+    let cancelled = false;
+    const syncWhileDisconnected = () => {
+      fetchSnapshot().then(() => {
+        if (!cancelled) {
+          setNotice((current) => current?.startsWith("Snapshot synchronization failed:")
+            ? ""
+            : current);
+        }
+      }).catch((error) => {
+        if (!cancelled) {
+          setConnectionStatus("OFFLINE");
+          setNotice((current) => current?.startsWith("Snapshot synchronization failed:")
+            ? current
+            : `Snapshot synchronization failed: ${error.message}`);
+        }
+      });
+    };
+    syncWhileDisconnected();
+    const interval = setInterval(syncWhileDisconnected, 7000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [connectionStatus, fetchSnapshot]);
 
   async function triggerSos(zone) {
     try {
@@ -154,268 +217,185 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ zone })
       });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || "SOS request failed");
-      }
-
-      setMessage(`SOS activated: ${zone}`);
-      setIncident({
-        type: "SOS",
-        severity: "CRITICAL",
-        action: `Security response required in ${zone}.`
-      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "SOS request failed.");
+      setNotice(`SOS activated for ${zone}.`);
     } catch (error) {
-      setMessage(error.message);
+      setNotice(error.message);
     }
   }
 
-  const activeZone = telemetry.incidentZone !== "NONE"
-    ? telemetry.incidentZone
-    : telemetry.sosZone !== "NONE"
-      ? telemetry.sosZone
-      : "LAB";
+  async function runScenario(scenario) {
+    setPendingScenario(scenario);
+    setScenarioMessage("");
+    setNotice("");
+
+    const baseline = {
+      deviceId: "ESP32-SIM",
+      zone: "LAB",
+      temperatureC: 25,
+      humidityPct: 45,
+      gasIndex: 100,
+      flame: false,
+      motion: false,
+      night: false,
+      occupancy: 5,
+      accessStatus: "NONE",
+      door: "LOCKED",
+      fan: false,
+      health: Object.fromEntries(EMPTY_HEALTH.map((sensor) => [sensor.toLowerCase(), true]))
+    };
+    const sensorScenarios = {
+      fire: { zone: "LAB", flame: true, temperatureC: 70 },
+      gas: { zone: "CANTEEN", gasIndex: 800 },
+      overheating: { zone: "LAB", temperatureC: 70 },
+      "high-crowd": { zone: "SECURITY CENTER", occupancy: 30 },
+      "critical-crowd": { zone: "SECURITY CENTER", occupancy: 45 },
+      "authorized-access": { zone: "SECURITY CENTER", accessStatus: "GRANTED", userName: "Demo Operator", fingerprintId: 1, door: "UNLOCKED" },
+      "unauthorized-access": { zone: "SECURITY CENTER", accessStatus: "DENIED", userName: "Demo Operator", fingerprintId: 999, door: "LOCKED" },
+      "night-mode": { zone: "LAB", night: true },
+      "night-intrusion": { zone: "LAB", night: true, motion: true },
+      "sensor-failure": { zone: "LAB", health: Object.fromEntries(EMPTY_HEALTH.map((sensor) => [sensor.toLowerCase(), false])) },
+      "restore-sensors": { zone: "LAB" }
+    };
+    const sosZones = {
+      "sos-lab": "LAB",
+      "sos-canteen": "CANTEEN",
+      "sos-parking": "PARKING"
+    };
+
+    try {
+      if (sosZones[scenario]) {
+        const response = await fetch(`${BACKEND}/api/sos`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ zone: sosZones[scenario] })
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || "SOS request failed.");
+        setScenarioMessage(`SOS recorded for ${sosZones[scenario]}.`);
+      } else if (scenario === "reset-system") {
+        for (const zone of CAMPUS_ZONES) {
+          const response = await fetch(`${BACKEND}/api/telemetry`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ ...baseline, zone, occupancy: 0 })
+          });
+          const payload = await response.json();
+          if (!response.ok) throw new Error(payload.error || `Reset telemetry failed for ${zone}.`);
+        }
+        setScenarioMessage("Normal telemetry sent to all six zones. Sensor state was restored; incident and access history was retained.");
+      } else {
+        const response = await fetch(`${BACKEND}/api/telemetry`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...baseline, ...sensorScenarios[scenario] })
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || "Simulation telemetry request failed.");
+        setScenarioMessage(
+          `${scenario.replaceAll("-", " ")} telemetry sent and recorded.`
+        );
+      }
+    } catch (error) {
+      setScenarioMessage(`Action failed: ${error.message}`);
+      setNotice(error.message);
+    } finally {
+      setPendingScenario("");
+    }
+  }
+
+  function openPage(nextPage) {
+    setPage(nextPage);
+    setMobileNavOpen(false);
+  }
+
+  const selectedPage = NAV_ITEMS.find((item) => item.id === page) || NAV_ITEMS[0];
+  const StatusIcon = connectionStatus === "LIVE" ? Wifi : WifiOff;
 
   return (
     <div className="app-shell">
       <header className="topbar">
-        <div>
-          <div className="eyebrow">IoT SAFETY PLATFORM</div>
-          <h1>Smart Campus Safety Command Center</h1>
-          <p>Detect • Assess • Respond • Guide • Record</p>
+        <button className="mobile-menu-button" aria-label="Open navigation" onClick={() => setMobileNavOpen(!mobileNavOpen)}>
+          {mobileNavOpen ? <X /> : <Menu />}
+        </button>
+        <div className="brand-lockup">
+          <div className="brand-mark"><Activity size={20} /></div>
+          <div><strong>Campus Safety</strong><span>Operations Center</span></div>
         </div>
-
-        <div className="system-pill">
-          {backendOnline ? <Wifi size={17} /> : <WifiOff size={17} />}
-          <span>{backendOnline ? "BACKEND ONLINE" : "BACKEND OFFLINE"}</span>
-          <span className="dot" />
-          <span>{telemetry.night ? "NIGHT MODE" : "DAY MODE"}</span>
+        <div className="topbar-page">
+          <span className="topbar-page-icon"><selectedPage.icon size={17} /></span>
+          <span>{selectedPage.label}</span>
+        </div>
+        <div className="topbar-status">
+          <div className="mode-state">
+            {telemetry.receivedAt ? (telemetry.night ? "NIGHT MODE" : "DAY MODE") : "MODE UNKNOWN"}
+          </div>
+          <div className={`connection-indicator ${connectionStatus.toLowerCase()}`} aria-live="polite">
+            <span className="connection-light" />
+            <span>{connectionStatus}</span>
+          </div>
+          <div className="update-time"><StatusIcon size={14} /> Updated {lastUpdate ? new Date(lastUpdate).toLocaleTimeString() : "waiting for telemetry"}</div>
         </div>
       </header>
 
-      <main className="dashboard">
-        {message && <div className="toast">{message}</div>}
-
-        <section className="stats-grid">
-          <StatCard icon={<Thermometer />} label="Temperature" value={`${Number(telemetry.temperatureC).toFixed(1)} °C`} />
-          <StatCard icon={<Gauge />} label="Gas Index" value={telemetry.gasIndex ?? "—"} />
-          <StatCard icon={<Users />} label="Occupancy" value={telemetry.occupancy ?? 0} />
-          <StatCard icon={<Radio />} label="Motion" value={telemetry.motion ? "DETECTED" : "CLEAR"} />
-          <StatCard icon={<Activity />} label="Flame" value={telemetry.flame ? "DETECTED" : "CLEAR"} />
-          <StatCard icon={<ShieldCheck />} label="Door" value={telemetry.door || "LOCKED"} />
-        </section>
-
-        <section className="content-grid">
-          <div className="panel map-panel">
-            <PanelTitle icon={<Map />} title="Campus Risk Map" subtitle="Live zone status and evacuation route" />
-
-            <div className="campus-map">
-              <svg className="map-lines" viewBox="0 0 100 100" preserveAspectRatio="none">
-                {edges.map(([a, b]) => {
-                  const p1 = zoneLayout[a];
-                  const p2 = zoneLayout[b];
-                  return (
-                    <line
-                      key={`${a}-${b}`}
-                      x1={p1.x + 10}
-                      y1={p1.y + 7}
-                      x2={p2.x + 10}
-                      y2={p2.y + 7}
-                    />
-                  );
-                })}
-
-                {route.route?.map((name, index) => {
-                  if (index === route.route.length - 1) return null;
-                  const p1 = zoneLayout[name];
-                  const p2 = zoneLayout[route.route[index + 1]];
-                  return (
-                    <line
-                      key={`route-${name}-${index}`}
-                      className="route-line"
-                      x1={p1.x + 10}
-                      y1={p1.y + 7}
-                      x2={p2.x + 10}
-                      y2={p2.y + 7}
-                    />
-                  );
-                })}
-              </svg>
-
-              {Object.entries(zoneLayout).map(([name, pos]) => {
-                const zone = zoneMap[name];
-                const isActive = name === activeZone;
-                const status = zone?.status || "NORMAL";
-
-                return (
-                  <div
-                    key={name}
-                    className={`zone ${severityClass(status === "BLOCKED" ? "CRITICAL" : status)} ${isActive ? "active-zone" : ""}`}
-                    style={{ left: `${pos.x}%`, top: `${pos.y}%` }}
-                  >
-                    <div className="zone-name">{name}</div>
-                    <div className="zone-status">{status}</div>
-                    <div className="zone-crowd">
-                      {zone?.occupancy ?? 0} people
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+      <div className="app-body">
+        <aside className={`sidebar ${mobileNavOpen ? "sidebar-open" : ""}`}>
+          <div className="sidebar-label">CAMPUS OPERATIONS</div>
+          <nav aria-label="Main navigation">
+            {NAV_ITEMS.map(({ id, label, icon: Icon }) => (
+              <button key={id} className={`nav-item ${page === id ? "selected" : ""}`} onClick={() => openPage(id)}>
+                <Icon size={18} strokeWidth={1.8} />
+                <span>{label}</span>
+                {id === "incidents" && activeIncidents.length > 0 && <span className="nav-count">{activeIncidents.length}</span>}
+              </button>
+            ))}
+          </nav>
+          <div className="sidebar-footer">
+            <span className="sidebar-footer-icon"><Radio size={16} /></span>
+            <div><strong>Live monitoring</strong><span>ESP32 telemetry link</span></div>
           </div>
+        </aside>
 
-          <div className="panel incident-panel">
-            <PanelTitle icon={<CircleAlert />} title="Current Incident" subtitle="Rule-based assessment" />
-
-            <div className={`incident-card ${severityClass(incident.severity)}`}>
-              <div className="incident-head">
-                <div>
-                  <div className="mini-label">INCIDENT</div>
-                  <h2>{incident.type || "NORMAL"}</h2>
-                </div>
-                <div className="severity-badge">{incident.severity}</div>
-              </div>
-
-              <div className="incident-details">
-                <Row label="Zone" value={telemetry.incidentZone || telemetry.sosZone || "NONE"} />
-                <Row label="Action" value={incident.action || telemetry.action || "Continue monitoring."} />
-                <Row label="Crowd" value={telemetry.crowdLevel || "LOW"} />
-                <Row label="Fan" value={telemetry.fan ? "ON" : "OFF"} />
-              </div>
-            </div>
-
-            <div className="route-card">
-              <div className="route-title">
-                <Route size={18} />
-                <span>Recommended Safe Route</span>
-              </div>
-              <div className="route-path">
-                {route.route?.length
-                  ? route.route.map((name, i) => (
-                      <span key={`${name}-${i}`}>
-                        <b>{name}</b>
-                        {i < route.route.length - 1 && <span className="arrow">→</span>}
-                      </span>
-                    ))
-                  : "No route available"}
-              </div>
-              <div className="route-cost">
-                Total route cost: <strong>{route.totalCost ?? "—"}</strong>
-              </div>
-            </div>
+        <main className="main-content">
+          {notice && <div className="notice-bar" role="status">{notice}<button aria-label="Dismiss notification" onClick={() => setNotice("")}><X size={15} /></button></div>}
+          <div hidden={page !== "overview"}>
+            <OverviewPage
+              zones={zones}
+              telemetry={telemetry}
+              activeIncidents={activeIncidents}
+              incident={incident}
+              sensorHealth={sensorHealth}
+              connectionStatus={connectionStatus}
+              lastUpdate={lastUpdate}
+              onSos={triggerSos}
+            />
           </div>
-        </section>
-
-        <section className="content-grid lower">
-          <div className="panel">
-            <PanelTitle icon={<Siren />} title="Emergency SOS" subtitle="Zone-aware emergency alerts" />
-            <div className="sos-grid">
-              {["LAB", "CANTEEN", "PARKING"].map((zone) => (
-                <button key={zone} className="sos-button" onClick={() => triggerSos(zone)}>
-                  <BellRing size={18} />
-                  <span>{zone} SOS</span>
-                </button>
-              ))}
-            </div>
+          <div hidden={page !== "routes"}>
+            <SafeRoutePage
+              zones={zones}
+              conditionsRevision={conditionsRevision}
+              onError={setNotice}
+            />
           </div>
-
-          <div className="panel">
-            <PanelTitle icon={<ShieldAlert />} title="Device & Sensor Health" subtitle="Virtual ESP32 status" />
-            <div className="health-list">
-              {Object.entries(telemetry.health || {
-                dht: true,
-                mq2: true,
-                pir: true,
-                ir: true,
-                ldr: true,
-                fingerprint: true
-              }).map(([name, online]) => (
-                <div className="health-row" key={name}>
-                  <span>{name.toUpperCase()}</span>
-                  <span className={online ? "online" : "offline"}>
-                    {online ? "ONLINE" : "OFFLINE"}
-                  </span>
-                </div>
-              ))}
-              <div className="health-row">
-                <span>Last update</span>
-                <span>{lastUpdate ? new Date(lastUpdate).toLocaleTimeString() : "—"}</span>
-              </div>
-            </div>
+          <div hidden={page !== "incidents"}>
+            <IncidentsPage incidents={incidents} activeIncidents={activeIncidents} />
           </div>
-        </section>
-
-        <section className="panel history-panel">
-          <PanelTitle icon={<Activity />} title="Incident History" subtitle="Latest events recorded in SQLite" />
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Zone</th>
-                  <th>Type</th>
-                  <th>Severity</th>
-                  <th>Status</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                {incidents.length === 0 ? (
-                  <tr>
-                    <td colSpan="6" className="empty">No incidents recorded yet.</td>
-                  </tr>
-                ) : (
-                  incidents.slice(0, 10).map((item) => (
-                    <tr key={item.id}>
-                      <td>{new Date(item.timestamp).toLocaleTimeString()}</td>
-                      <td>{item.zone_name || "—"}</td>
-                      <td>{item.type}</td>
-                      <td><span className={`table-severity ${severityClass(item.severity)}`}>{item.severity}</span></td>
-                      <td>{item.status}</td>
-                      <td>{item.recommended_action || "—"}</td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
+          <div hidden={page !== "access"}>
+            <AccessControlPage accessLogs={accessLogs} />
           </div>
-        </section>
-      </main>
-    </div>
-  );
-}
-
-function StatCard({ icon, label, value }) {
-  return (
-    <div className="stat-card">
-      <div className="stat-icon">{icon}</div>
-      <div>
-        <div className="stat-label">{label}</div>
-        <div className="stat-value">{value}</div>
+          <div hidden={page !== "health"}>
+            <SystemHealthPage sensorHealth={sensorHealth} telemetry={telemetry} lastUpdate={lastUpdate} />
+          </div>
+          <div hidden={page !== "demo"}>
+            <DemoPage
+              onRunScenario={runScenario}
+              pendingScenario={pendingScenario}
+              resultMessage={scenarioMessage}
+            />
+          </div>
+        </main>
       </div>
-    </div>
-  );
-}
-
-function PanelTitle({ icon, title, subtitle }) {
-  return (
-    <div className="panel-title">
-      <div className="panel-icon">{icon}</div>
-      <div>
-        <h3>{title}</h3>
-        <p>{subtitle}</p>
-      </div>
-    </div>
-  );
-}
-
-function Row({ label, value }) {
-  return (
-    <div className="detail-row">
-      <span>{label}</span>
-      <strong>{value}</strong>
     </div>
   );
 }

@@ -27,6 +27,11 @@ function initDatabase() {
   const schema = fs.readFileSync(schemaPath, "utf8");
   db.exec(schema);
 
+  const accessLogColumns = db.prepare("PRAGMA table_info(access_logs)").all();
+  if (!accessLogColumns.some((column) => column.name === "door_state")) {
+    db.exec("ALTER TABLE access_logs ADD COLUMN door_state TEXT NOT NULL DEFAULT 'LOCKED'");
+  }
+
   const zones = [
     [1, "LAB"],
     [2, "CLASSROOM"],
